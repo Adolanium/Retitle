@@ -2,9 +2,11 @@ from pathlib import Path
 
 import click
 
+from retitle.api.opensubtitles import OpenSubtitlesClient
 from retitle.api.tmdb import TMDBClient
 from retitle.api.tvmaze import TVMazeClient
 from retitle.renamer import MEDIA_EXTENSIONS, RenameProposal, Renamer
+from retitle.subtitles import SubtitleDownloader, SubtitleProposal
 
 
 @click.group()
@@ -103,6 +105,108 @@ def _display_proposals(proposals: list[RenameProposal]):
         elif p.status == "error":
             click.echo(f"\n{prefix} {p.original_path.name}")
             click.secho(f"   !! {p.error_message}. Skipping.", fg="red")
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--language", "-l", default="en", help="Subtitle language code (e.g., en, fr, es)")
+@click.option("--dry-run", "-n", is_flag=True, help="Search only, don't download")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+@click.option("--recursive", "-r", is_flag=True, help="Process subdirectories")
+def subtitles(path: str, language: str, dry_run: bool, yes: bool, recursive: bool):
+    """Download subtitles for media files.
+
+    PATH can be a single file or a directory.
+    Searches OpenSubtitles for matching subtitles and saves .srt files
+    alongside the media files.
+    """
+    target = Path(path).resolve()
+
+    try:
+        os_client = OpenSubtitlesClient()
+    except ValueError:
+        click.secho(
+            "OpenSubtitles not configured. Set OPENSUBTITLES_API_KEY, "
+            "OPENSUBTITLES_USERNAME, and OPENSUBTITLES_PASSWORD in .env",
+            fg="red",
+        )
+        return
+
+    downloader = SubtitleDownloader(os_client, language=language)
+
+    if target.is_file():
+        if target.suffix.lower() not in MEDIA_EXTENSIONS:
+            click.echo(f"Not a recognized media file: {target.name}")
+            click.echo(f"Supported: {', '.join(sorted(MEDIA_EXTENSIONS))}")
+            return
+        from retitle.parser import parse_filename
+
+        parsed = parse_filename(target.name)
+        proposals = [downloader.propose_subtitle(target, parsed)]
+    elif target.is_dir():
+        click.echo(f"Scanning {'recursively ' if recursive else ''}{target} ...")
+        proposals = downloader.propose_batch(target, recursive=recursive)
+        if not proposals:
+            click.echo("No media files found.")
+            return
+    else:
+        click.echo(f"Not a valid file or directory: {path}")
+        return
+
+    _display_subtitle_proposals(proposals)
+
+    found = [p for p in proposals if p.status == "found"]
+    if not found:
+        click.echo("\nNo subtitles available to download.")
+        return
+
+    if dry_run:
+        click.echo(f"\nDry run: {len(found)} subtitle(s) found.")
+        return
+
+    if not yes:
+        click.echo()
+        if not click.confirm(f"Download {len(found)} subtitle(s)?", default=False):
+            click.echo("Cancelled.")
+            return
+
+    success = 0
+    for proposal in found:
+        try:
+            if downloader.execute_download(proposal):
+                success += 1
+        except Exception as e:
+            click.echo(f"  !! Error downloading for {proposal.media_path.name}: {e}")
+
+    click.echo(f"\nDownloaded {success}/{len(found)} subtitle(s).")
+
+
+def _display_subtitle_proposals(proposals: list[SubtitleProposal]):
+    """Display subtitle search results to the user."""
+    total = len(proposals)
+    for i, p in enumerate(proposals, 1):
+        prefix = f"[{i}/{total}]"
+
+        if p.status == "found" and p.selected_result:
+            click.echo(f"\n{prefix} {p.media_path.name}")
+            release = p.selected_result.release or "Unknown release"
+            count = f"{p.selected_result.download_count:,}"
+            click.secho(
+                f"   Sub: Found ({p.language}) — \"{release}\" ({count} downloads)",
+                fg="green",
+            )
+
+        elif p.status == "not_found":
+            click.echo(f"\n{prefix} {p.media_path.name}")
+            click.secho(f"   Sub: Not found ({p.language})", fg="yellow")
+
+        elif p.status == "skipped":
+            click.echo(f"\n{prefix} {p.media_path.name}")
+            click.secho(f"   Sub: Already exists. Skipping.", fg="cyan")
+
+        elif p.status == "error":
+            click.echo(f"\n{prefix} {p.media_path.name}")
+            click.secho(f"   Sub: Error — {p.error_message}", fg="red")
 
 
 @cli.command()
