@@ -11,7 +11,7 @@ from retitle.api.opensubtitles import (
 from retitle.api.tmdb import TMDBClient
 from retitle.api.tvmaze import TVMazeClient
 from retitle.parser import parse_filename
-from retitle.renamer import MEDIA_EXTENSIONS, RenameProposal, Renamer
+from retitle.renamer import MEDIA_EXTENSIONS, RenameProposal, Renamer, SearchMatch
 
 LANGUAGES = [
     ("Arabic", "ar"), ("Chinese", "zh"), ("Czech", "cs"),
@@ -24,6 +24,235 @@ LANGUAGES = [
 ]
 
 DEFAULT_LANG_INDEX = 4  # English
+
+
+class MatchDialog(tk.Toplevel):
+    """Dialog for choosing from API search results or editing GuessIt parse."""
+
+    def __init__(self, parent, proposal: RenameProposal, renamer: Renamer):
+        super().__init__(parent)
+        self.proposal = proposal
+        self.renamer = renamer
+        self.result = None
+        self.matches: list[SearchMatch] = []
+
+        self.title(f"Choose Match \u2014 {proposal.original_path.name}")
+        self.geometry("650x480")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        parsed = proposal.parsed
+
+        # --- Parsed from filename (GuessIt) ---
+        gi_frame = ttk.LabelFrame(self, text="Parsed from Filename (GuessIt)", padding=8)
+        gi_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+
+        row1 = ttk.Frame(gi_frame)
+        row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text="Title:").pack(side=tk.LEFT)
+        self.dlg_title_var = tk.StringVar(value=parsed.title or "")
+        ttk.Entry(row1, textvariable=self.dlg_title_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8),
+        )
+        ttk.Label(row1, text="Type:").pack(side=tk.LEFT)
+        self.dlg_type_var = tk.StringVar(value=parsed.media_type)
+        ttk.Combobox(
+            row1, textvariable=self.dlg_type_var,
+            values=["episode", "movie"], state="readonly", width=8,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        row2 = ttk.Frame(gi_frame)
+        row2.pack(fill=tk.X, pady=2)
+        ttk.Label(row2, text="Season:").pack(side=tk.LEFT)
+        self.dlg_season_var = tk.StringVar(
+            value=str(parsed.season) if parsed.season is not None else "",
+        )
+        ttk.Entry(row2, textvariable=self.dlg_season_var, width=6).pack(
+            side=tk.LEFT, padx=(8, 16),
+        )
+        ttk.Label(row2, text="Episode:").pack(side=tk.LEFT)
+        if isinstance(parsed.episode, list):
+            ep_display = ", ".join(str(e) for e in parsed.episode)
+        else:
+            ep_display = str(parsed.episode) if parsed.episode is not None else ""
+        self.dlg_episode_var = tk.StringVar(value=ep_display)
+        ttk.Entry(row2, textvariable=self.dlg_episode_var, width=8).pack(
+            side=tk.LEFT, padx=(8, 16),
+        )
+        ttk.Label(row2, text="Year:").pack(side=tk.LEFT)
+        self.dlg_year_var = tk.StringVar(
+            value=str(parsed.year) if parsed.year is not None else "",
+        )
+        ttk.Entry(row2, textvariable=self.dlg_year_var, width=6).pack(
+            side=tk.LEFT, padx=(8, 8),
+        )
+        ttk.Button(row2, text="Search", command=self._search).pack(side=tk.RIGHT)
+
+        # --- Search results ---
+        res_frame = ttk.LabelFrame(self, text="Search Results", padding=8)
+        res_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        cols = ("source", "title", "info")
+        self.match_tree = ttk.Treeview(
+            res_frame, columns=cols, show="headings", selectmode="browse",
+        )
+        self.match_tree.heading("source", text="Source")
+        self.match_tree.heading("title", text="Title")
+        self.match_tree.heading("info", text="Info")
+        self.match_tree.column("source", width=60, minwidth=50)
+        self.match_tree.column("title", width=320, minwidth=150)
+        self.match_tree.column("info", width=180, minwidth=80)
+
+        vsb = ttk.Scrollbar(
+            res_frame, orient=tk.VERTICAL, command=self.match_tree.yview,
+        )
+        self.match_tree.configure(yscrollcommand=vsb.set)
+        self.match_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.match_tree.bind("<Double-1>", lambda _e: self._select_match())
+
+        self.dlg_status_var = tk.StringVar(value="Searching...")
+        ttk.Label(
+            self, textvariable=self.dlg_status_var, foreground="#555555",
+        ).pack(padx=10, anchor=tk.W)
+
+        # --- Buttons ---
+        btn_frame = ttk.Frame(self, padding=10)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="Cancel", command=self._cancel).pack(
+            side=tk.RIGHT, padx=(8, 0),
+        )
+        self.select_btn = ttk.Button(
+            btn_frame, text="Use Selected", command=self._select_match,
+        )
+        self.select_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.select_btn.state(["disabled"])
+        ttk.Button(
+            btn_frame, text="Use Parsed Only", command=self._use_parsed,
+        ).pack(side=tk.RIGHT)
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self._search()
+
+    # --- field parsers ---
+
+    def _parse_episode(self):
+        val = self.dlg_episode_var.get().strip()
+        if not val:
+            return None
+        parts = [p.strip() for p in val.replace("-", ",").split(",") if p.strip()]
+        nums = []
+        for p in parts:
+            try:
+                nums.append(int(p))
+            except ValueError:
+                pass
+        if not nums:
+            return None
+        return nums[0] if len(nums) == 1 else nums
+
+    def _parse_season(self):
+        val = self.dlg_season_var.get().strip()
+        try:
+            return int(val) if val else None
+        except ValueError:
+            return None
+
+    def _parse_year(self):
+        val = self.dlg_year_var.get().strip()
+        try:
+            return int(val) if val else None
+        except ValueError:
+            return None
+
+    # --- search ---
+
+    def _search(self):
+        title = self.dlg_title_var.get().strip()
+        if not title:
+            self.dlg_status_var.set("Enter a title to search.")
+            return
+        media_type = self.dlg_type_var.get()
+        year = self._parse_year()
+        self.match_tree.delete(*self.match_tree.get_children())
+        self.matches.clear()
+        self.dlg_status_var.set("Searching...")
+        self.select_btn.state(["disabled"])
+        threading.Thread(
+            target=self._search_worker, args=(title, media_type, year), daemon=True,
+        ).start()
+
+    def _search_worker(self, title, media_type, year):
+        try:
+            if media_type == "episode":
+                matches = self.renamer.search_tv_matches(title)
+            else:
+                matches = self.renamer.search_movie_matches(title, year)
+            try:
+                self.after(0, self._populate_matches, matches)
+            except tk.TclError:
+                pass
+        except Exception as e:
+            try:
+                self.after(0, lambda: self.dlg_status_var.set(f"Error: {e}"))
+            except tk.TclError:
+                pass
+
+    def _populate_matches(self, matches):
+        self.matches = list(matches)
+        self.match_tree.delete(*self.match_tree.get_children())
+        for i, m in enumerate(matches):
+            info_parts = []
+            if m.year:
+                info_parts.append(f"({m.year})")
+            if m.extra_info:
+                info_parts.append(m.extra_info)
+            self.match_tree.insert(
+                "", tk.END, iid=str(i),
+                values=(m.source, m.title, " ".join(info_parts)),
+            )
+        if matches:
+            self.match_tree.selection_set("0")
+            self.select_btn.state(["!disabled"])
+            self.dlg_status_var.set(
+                f"{len(matches)} result(s). Select one and click 'Use Selected'.",
+            )
+        else:
+            self.dlg_status_var.set("No results found.")
+
+    # --- actions ---
+
+    def _select_match(self):
+        selected = self.match_tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        self.result = {
+            "choice": "match",
+            "match": self.matches[idx],
+            "media_type": self.dlg_type_var.get(),
+            "season": self._parse_season(),
+            "episode": self._parse_episode(),
+            "year": self._parse_year(),
+        }
+        self.destroy()
+
+    def _use_parsed(self):
+        self.result = {
+            "choice": "parsed",
+            "match": None,
+            "media_type": self.dlg_type_var.get(),
+            "title": self.dlg_title_var.get().strip(),
+            "season": self._parse_season(),
+            "episode": self._parse_episode(),
+            "year": self._parse_year(),
+        }
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
 
 
 class RetitleApp:
@@ -96,6 +325,10 @@ class RetitleApp:
         ttk.Checkbutton(
             opts, text="Recursive (scan subfolders)", variable=self.recursive_var,
         ).pack(side=tk.LEFT)
+        self.parsed_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            opts, text="Parsed only (skip API)", variable=self.parsed_only_var,
+        ).pack(side=tk.LEFT, padx=(16, 0))
         ttk.Button(opts, text="Scan", command=self._scan).pack(
             side=tk.RIGHT, padx=(8, 0),
         )
@@ -129,6 +362,7 @@ class RetitleApp:
         self.tree.tag_configure("no_match", foreground="#b71c1c")
         self.tree.tag_configure("error", foreground="#b71c1c")
         self.tree.tag_configure("skipped", foreground="#757575")
+        self.tree.bind("<Double-1>", self._on_rename_row_double_click)
 
         # --- Bottom bar ---
         bottom = ttk.Frame(parent, padding=10)
@@ -161,13 +395,11 @@ class RetitleApp:
         )
         if path:
             self.rename_path_var.set(path)
-            self._scan()
 
     def _rename_browse_folder(self):
         path = filedialog.askdirectory(title="Select Folder")
         if path:
             self.rename_path_var.set(path)
-            self._scan()
 
     # --- Rename: scan ---
 
@@ -189,24 +421,172 @@ class RetitleApp:
         self.rename_status_var.set("Scanning...")
         self.root.update_idletasks()
 
-        thread = threading.Thread(target=self._scan_worker, args=(target,), daemon=True)
-        thread.start()
+        if self.parsed_only_var.get():
+            threading.Thread(
+                target=self._scan_worker_parsed, args=(target,), daemon=True,
+            ).start()
+        else:
+            threading.Thread(
+                target=self._scan_parse_worker, args=(target,), daemon=True,
+            ).start()
 
-    def _scan_worker(self, target: Path):
+    def _scan_worker_parsed(self, target: Path):
+        """Scan with parsed-only mode (no API calls, no dialogs)."""
         try:
             if target.is_file():
                 if target.suffix.lower() not in MEDIA_EXTENSIONS:
                     self.root.after(
-                        0, lambda: self.rename_status_var.set(f"Not a media file: {target.name}"),
+                        0, lambda: self.rename_status_var.set(
+                            f"Not a media file: {target.name}",
+                        ),
                     )
                     return
-                proposals = [self.renamer.propose_rename(target)]
+                proposals = [self.renamer.propose_rename(target, parsed_only=True)]
             else:
-                proposals = self.renamer.propose_batch(target, recursive=self.recursive_var.get())
-
+                proposals = self.renamer.propose_batch(
+                    target, recursive=self.recursive_var.get(), parsed_only=True,
+                )
             self.root.after(0, self._populate_table, proposals)
         except Exception as e:
             self.root.after(0, lambda: self.rename_status_var.set(f"Error: {e}"))
+
+    def _scan_parse_worker(self, target: Path):
+        """Parse filenames then hand off to main thread for match selection."""
+        try:
+            pairs = []
+            if target.is_file():
+                if target.suffix.lower() not in MEDIA_EXTENSIONS:
+                    self.root.after(
+                        0, lambda: self.rename_status_var.set(
+                            f"Not a media file: {target.name}",
+                        ),
+                    )
+                    return
+                pairs.append((target, parse_filename(target.name)))
+            else:
+                recursive = self.recursive_var.get()
+                files = sorted(
+                    target.rglob("*") if recursive else target.iterdir(),
+                )
+                for f in files:
+                    if f.is_file() and f.suffix.lower() in MEDIA_EXTENSIONS:
+                        pairs.append((f, parse_filename(f.name)))
+
+            if not pairs:
+                self.root.after(
+                    0, lambda: self.rename_status_var.set("No media files found."),
+                )
+                return
+
+            self.root.after(0, self._show_match_dialogs, pairs)
+        except Exception as e:
+            self.root.after(0, lambda: self.rename_status_var.set(f"Error: {e}"))
+
+    def _show_match_dialogs(self, file_parsed_pairs):
+        """Show a selection dialog per unique title, then generate proposals."""
+        # Group files by (title, media_type) so each unique title gets one dialog
+        groups = {}
+        for filepath, parsed in file_parsed_pairs:
+            if parsed.confidence == "low" or not parsed.title:
+                key = None
+            else:
+                key = (parsed.title.lower(), parsed.media_type)
+            groups.setdefault(key, []).append((filepath, parsed))
+
+        self.rename_status_var.set(
+            f"Parsed {len(file_parsed_pairs)} file(s). Choose matches...",
+        )
+
+        title_selections = {}
+        for key, items in groups.items():
+            if key is None:
+                continue
+
+            filepath, parsed = items[0]
+            temp_proposal = RenameProposal(
+                original_path=filepath,
+                new_filename=None,
+                new_path=None,
+                parsed=parsed,
+                api_result=None,
+                status="no_match",
+            )
+
+            dialog = MatchDialog(self.root, temp_proposal, self.renamer)
+            if len(items) > 1:
+                dialog.title(
+                    f"Choose Match \u2014 {parsed.title} ({len(items)} files)",
+                )
+            self.root.wait_window(dialog)
+
+            if dialog.result is not None:
+                title_selections[key] = dialog.result
+
+        self.rename_status_var.set("Generating proposals...")
+        self.root.update_idletasks()
+
+        threading.Thread(
+            target=self._generate_proposals_worker,
+            args=(file_parsed_pairs, title_selections),
+            daemon=True,
+        ).start()
+
+    def _generate_proposals_worker(self, file_parsed_pairs, title_selections):
+        """Build proposals from user's match selections."""
+        try:
+            proposals = []
+            for filepath, parsed in file_parsed_pairs:
+                if parsed.confidence == "low" or not parsed.title:
+                    proposals.append(RenameProposal(
+                        original_path=filepath,
+                        new_filename=None,
+                        new_path=None,
+                        parsed=parsed,
+                        api_result=None,
+                        status="no_match",
+                        error_message="Could not identify media from filename",
+                    ))
+                    continue
+
+                key = (parsed.title.lower(), parsed.media_type)
+                choice = title_selections.get(key)
+
+                if choice is None:
+                    proposals.append(
+                        self.renamer.propose_rename(filepath, parsed_only=True),
+                    )
+                elif choice["choice"] == "match":
+                    match = choice["match"]
+                    media_type = choice["media_type"]
+                    season = parsed.season
+                    episode = parsed.episode
+                    if (
+                        media_type == "episode"
+                        and season is not None
+                        and episode is not None
+                    ):
+                        proposals.append(self.renamer.propose_tv_with_match(
+                            filepath, parsed, match, season, episode,
+                        ))
+                    else:
+                        proposals.append(self.renamer.propose_movie_with_match(
+                            filepath, parsed, match,
+                        ))
+                else:
+                    proposals.append(self.renamer.propose_with_overrides(
+                        filepath, parsed,
+                        title=choice["title"],
+                        media_type=choice["media_type"],
+                        season=parsed.season,
+                        episode=parsed.episode,
+                        year=choice.get("year") or parsed.year,
+                    ))
+
+            self.root.after(0, self._populate_table, proposals)
+        except Exception as e:
+            self.root.after(
+                0, lambda: self.rename_status_var.set(f"Error: {e}"),
+            )
 
     def _populate_table(self, proposals: list[RenameProposal]):
         self.proposals = proposals
@@ -230,7 +610,10 @@ class RetitleApp:
 
         ready_count = sum(1 for p in proposals if p.status == "ready")
         total = len(proposals)
-        self.rename_status_var.set(f"{total} file(s) scanned. {ready_count} ready to rename.")
+        self.rename_status_var.set(
+            f"{total} file(s) scanned. {ready_count} ready to rename."
+            " Double-click a row to change match."
+        )
 
         if ready_count > 0:
             self.rename_btn.state(["!disabled"])
@@ -279,7 +662,120 @@ class RetitleApp:
         self.rename_status_var.set(f"Renamed {success}/{len(proposals)} file(s).")
         if errors:
             messagebox.showwarning("Some errors", "\n".join(errors))
-        self._scan()
+        self._refresh_after_rename()
+
+    def _refresh_after_rename(self):
+        """Re-scan with parsed-only to update table without re-showing dialogs."""
+        path_str = self.rename_path_var.get().strip()
+        if not path_str:
+            return
+        target = Path(path_str)
+        if not target.exists():
+            return
+        self.tree.delete(*self.tree.get_children())
+        self.proposals.clear()
+        self.rename_btn.state(["disabled"])
+        self.rename_all_btn.state(["disabled"])
+        threading.Thread(
+            target=self._scan_worker_parsed, args=(target,), daemon=True,
+        ).start()
+
+    # --- Rename: match selection ---
+
+    def _on_rename_row_double_click(self, event):
+        """Open match selection dialog on double-click."""
+        row_id = self.tree.identify_row(event.y)
+        if not row_id:
+            return
+        idx = int(row_id)
+        if idx >= len(self.proposals):
+            return
+
+        proposal = self.proposals[idx]
+        dialog = MatchDialog(self.root, proposal, self.renamer)
+        self.root.wait_window(dialog)
+
+        if dialog.result is None:
+            return
+
+        self.rename_status_var.set("Updating match...")
+        self.root.update_idletasks()
+
+        threading.Thread(
+            target=self._apply_match_worker,
+            args=(idx, dialog.result),
+            daemon=True,
+        ).start()
+
+    def _apply_match_worker(self, idx, choice):
+        """Generate new proposal based on user's match selection."""
+        try:
+            proposal = self.proposals[idx]
+            filepath = proposal.original_path
+            parsed = proposal.parsed
+
+            if choice["choice"] == "match":
+                match = choice["match"]
+                media_type = choice["media_type"]
+                season = choice["season"]
+                episode = choice["episode"]
+
+                if media_type == "episode" and season is not None and episode is not None:
+                    new_proposal = self.renamer.propose_tv_with_match(
+                        filepath, parsed, match, season, episode,
+                    )
+                else:
+                    new_proposal = self.renamer.propose_movie_with_match(
+                        filepath, parsed, match,
+                    )
+            else:
+                new_proposal = self.renamer.propose_with_overrides(
+                    filepath, parsed,
+                    title=choice["title"],
+                    media_type=choice["media_type"],
+                    season=choice["season"],
+                    episode=choice["episode"],
+                    year=choice["year"],
+                )
+
+            self.root.after(0, self._update_row, idx, new_proposal)
+        except Exception as e:
+            self.root.after(
+                0, lambda: self.rename_status_var.set(f"Error updating match: {e}"),
+            )
+
+    def _update_row(self, idx, new_proposal: RenameProposal):
+        """Update a single row in the rename table after match selection."""
+        self.proposals[idx] = new_proposal
+
+        status_text = {
+            "ready": "\u2713 Ready",
+            "conflict": "\u26a0 Conflict",
+            "no_match": "\u2717 No match",
+            "error": "\u2717 Error",
+            "skipped": "- Skip",
+        }.get(new_proposal.status, new_proposal.status)
+
+        new_name = new_proposal.new_filename or new_proposal.error_message or ""
+        self.tree.item(
+            str(idx),
+            values=(status_text, new_proposal.original_path.name, new_name),
+            tags=(new_proposal.status,),
+        )
+
+        ready_count = sum(1 for p in self.proposals if p.status == "ready")
+        total = len(self.proposals)
+        self.rename_status_var.set(
+            f"{total} file(s) scanned. {ready_count} ready to rename."
+            " Double-click a row to change match."
+        )
+
+        if ready_count > 0:
+            self.rename_btn.state(["!disabled"])
+            self.rename_all_btn.state(["!disabled"])
+        else:
+            self.rename_btn.state(["disabled"])
+            self.rename_all_btn.state(["disabled"])
 
     # ================================================================
     #  SUBTITLES TAB
