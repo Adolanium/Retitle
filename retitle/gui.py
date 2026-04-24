@@ -3,6 +3,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
+from retitle.api.musicbrainz import MusicBrainzClient, ReleaseSearchResult
 from retitle.api.opensubtitles import (
     OpenSubtitlesClient,
     SubtitleSearchResult,
@@ -10,6 +11,12 @@ from retitle.api.opensubtitles import (
 )
 from retitle.api.tmdb import TMDBClient
 from retitle.api.tvmaze import TVMazeClient
+from retitle.music import (
+    AUDIO_EXTENSIONS,
+    AlbumGroup,
+    AlbumProposal,
+    MusicRenamer,
+)
 from retitle.parser import parse_filename
 from retitle.renamer import MEDIA_EXTENSIONS, RenameProposal, Renamer, SearchMatch
 
@@ -277,10 +284,14 @@ class RetitleApp:
         except ValueError:
             pass  # OpenSubtitles not configured
 
+        self.musicbrainz = MusicBrainzClient()
+        self.music_renamer = MusicRenamer(self.musicbrainz)
+
         # --- State ---
         self.proposals: list[RenameProposal] = []
         self.sub_results: list[SubtitleSearchResult] = []
         self._sub_file_path: Path | None = None
+        self.album_proposals: list[AlbumProposal] = []
 
         self._build_ui()
 
@@ -295,6 +306,10 @@ class RetitleApp:
         sub_frame = ttk.Frame(notebook)
         notebook.add(sub_frame, text="  Subtitles  ")
         self._build_subtitles_tab(sub_frame)
+
+        music_frame = ttk.Frame(notebook)
+        notebook.add(music_frame, text="  Music  ")
+        self._build_music_tab(music_frame)
 
     # ================================================================
     #  RENAME TAB
@@ -1126,6 +1141,479 @@ class RetitleApp:
             self.root.after(0, lambda: self.sub_status_var.set(f"Download error: {e}"))
         finally:
             self.root.after(0, lambda: self.sub_download_btn.state(["!disabled"]))
+
+
+    # ================================================================
+    #  MUSIC TAB
+    # ================================================================
+
+    def _build_music_tab(self, parent):
+        top = ttk.Frame(parent, padding=10)
+        top.pack(fill=tk.X)
+
+        ttk.Label(top, text="Path:").pack(side=tk.LEFT)
+        self.music_path_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.music_path_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8),
+        )
+        ttk.Button(top, text="Browse File", command=self._music_browse_file).pack(
+            side=tk.LEFT, padx=(0, 4),
+        )
+        ttk.Button(top, text="Browse Folder", command=self._music_browse_folder).pack(
+            side=tk.LEFT,
+        )
+
+        opts = ttk.Frame(parent, padding=(10, 0, 10, 8))
+        opts.pack(fill=tk.X)
+
+        self.music_recursive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            opts, text="Recursive", variable=self.music_recursive_var,
+        ).pack(side=tk.LEFT)
+        self.music_folder_rename_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opts, text="Rename album folder",
+            variable=self.music_folder_rename_var,
+        ).pack(side=tk.LEFT, padx=(16, 0))
+        self.music_write_tags_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opts, text="Apply tags",
+            variable=self.music_write_tags_var,
+        ).pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Button(opts, text="Scan", command=self._music_scan).pack(
+            side=tk.RIGHT, padx=(8, 0),
+        )
+
+        table_frame = ttk.Frame(parent, padding=(10, 0, 10, 0))
+        table_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.music_tree = ttk.Treeview(
+            table_frame,
+            columns=("status", "original", "new_name"),
+            show="tree headings",
+            selectmode="browse",
+        )
+        self.music_tree.heading("#0", text="Album")
+        self.music_tree.heading("status", text="Status")
+        self.music_tree.heading("original", text="Original")
+        self.music_tree.heading("new_name", text="New")
+        self.music_tree.column("#0", width=280, minwidth=150)
+        self.music_tree.column("status", width=80, minwidth=60, anchor=tk.CENTER)
+        self.music_tree.column("original", width=300, minwidth=150)
+        self.music_tree.column("new_name", width=300, minwidth=150)
+
+        vsb = ttk.Scrollbar(
+            table_frame, orient=tk.VERTICAL, command=self.music_tree.yview,
+        )
+        hsb = ttk.Scrollbar(
+            table_frame, orient=tk.HORIZONTAL, command=self.music_tree.xview,
+        )
+        self.music_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.music_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
+        self.music_tree.tag_configure("ready", foreground="#2e7d32")
+        self.music_tree.tag_configure("conflict", foreground="#e65100")
+        self.music_tree.tag_configure("no_match", foreground="#b71c1c")
+        self.music_tree.tag_configure("error", foreground="#b71c1c")
+        self.music_tree.tag_configure("skipped", foreground="#757575")
+        self.music_tree.tag_configure("album", foreground="#1565c0")
+        self.music_tree.bind("<Double-1>", self._on_music_album_double_click)
+
+        bottom = ttk.Frame(parent, padding=10)
+        bottom.pack(fill=tk.X)
+
+        self.music_status_var = tk.StringVar(
+            value="Select a folder containing an album to get started.",
+        )
+        ttk.Label(
+            bottom, textvariable=self.music_status_var, foreground="#555555",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.music_apply_btn = ttk.Button(
+            bottom, text="Apply All", command=self._music_apply_all,
+        )
+        self.music_apply_btn.pack(side=tk.RIGHT)
+        self.music_apply_btn.state(["disabled"])
+
+    def _music_browse_file(self):
+        exts = " ".join(f"*{e}" for e in sorted(AUDIO_EXTENSIONS))
+        path = filedialog.askopenfilename(
+            title="Select Audio File",
+            filetypes=[("Audio files", exts), ("All files", "*.*")],
+        )
+        if path:
+            self.music_path_var.set(path)
+
+    def _music_browse_folder(self):
+        path = filedialog.askdirectory(title="Select Music Folder")
+        if path:
+            self.music_path_var.set(path)
+
+    def _music_scan(self):
+        path_str = self.music_path_var.get().strip()
+        if not path_str:
+            messagebox.showwarning("No path", "Select a file or folder first.")
+            return
+        target = Path(path_str)
+        if not target.exists():
+            messagebox.showerror("Not found", f"Path does not exist:\n{path_str}")
+            return
+
+        self.music_tree.delete(*self.music_tree.get_children())
+        self.album_proposals.clear()
+        self.music_apply_btn.state(["disabled"])
+        self.music_status_var.set("Scanning & matching (MusicBrainz)...")
+        self.root.update_idletasks()
+
+        threading.Thread(
+            target=self._music_scan_worker, args=(target,), daemon=True,
+        ).start()
+
+    def _music_scan_worker(self, target: Path):
+        try:
+            groups = self.music_renamer.scan(
+                target, recursive=self.music_recursive_var.get(),
+            )
+            if not groups:
+                self.root.after(
+                    0, lambda: self.music_status_var.set("No audio files found."),
+                )
+                return
+
+            proposals = []
+            for group in groups:
+                self.root.after(
+                    0, lambda g=group: self.music_status_var.set(
+                        f"Matching: {g.folder.name}...",
+                    ),
+                )
+                release = self.music_renamer.auto_match(group)
+                ap = self.music_renamer.build_album_proposal(
+                    group, release,
+                    rename_folder=self.music_folder_rename_var.get(),
+                )
+                proposals.append(ap)
+
+            self.root.after(0, self._music_populate_tree, proposals)
+        except Exception as e:
+            self.root.after(
+                0, lambda: self.music_status_var.set(f"Error: {e}"),
+            )
+
+    def _music_populate_tree(self, proposals: list[AlbumProposal]):
+        self.album_proposals = proposals
+        self.music_tree.delete(*self.music_tree.get_children())
+
+        total_ready = 0
+        for album_idx, ap in enumerate(proposals):
+            if ap.release:
+                yr = f" [{ap.release.year}]" if ap.release.year else ""
+                album_label = f"{ap.release.artist} - {ap.release.title}{yr}"
+                album_status = "ready"
+            else:
+                album_label = (
+                    f"{ap.group.folder.name} (no match — double-click to search)"
+                )
+                album_status = "no_match"
+
+            album_iid = f"album:{album_idx}"
+            new_folder = ap.new_folder_name or ""
+            self.music_tree.insert(
+                "", tk.END, iid=album_iid,
+                text=album_label,
+                values=("", ap.group.folder.name, new_folder),
+                tags=("album", album_status),
+                open=True,
+            )
+
+            for track_idx, t in enumerate(ap.tracks):
+                status_text = {
+                    "ready": "✓",
+                    "conflict": "⚠",
+                    "no_match": "✗",
+                    "error": "✗",
+                    "skipped": "-",
+                }.get(t.status, t.status)
+                new_name = t.new_filename or t.error_message or ""
+                self.music_tree.insert(
+                    album_iid, tk.END,
+                    iid=f"track:{album_idx}:{track_idx}",
+                    text="",
+                    values=(status_text, t.original_path.name, new_name),
+                    tags=(t.status,),
+                )
+                if t.status == "ready":
+                    total_ready += 1
+
+        folder_ready = sum(1 for p in proposals if p.folder_status == "ready")
+        self.music_status_var.set(
+            f"{len(proposals)} album(s). {total_ready} track(s) ready, "
+            f"{folder_ready} folder rename(s). Double-click an album to re-match."
+        )
+        if total_ready > 0 or folder_ready > 0:
+            self.music_apply_btn.state(["!disabled"])
+
+    def _on_music_album_double_click(self, event):
+        row_id = self.music_tree.identify_row(event.y)
+        if not row_id or not row_id.startswith("album:"):
+            return
+        album_idx = int(row_id.split(":", 1)[1])
+        if album_idx >= len(self.album_proposals):
+            return
+
+        ap = self.album_proposals[album_idx]
+        dialog = MusicMatchDialog(self.root, ap.group, self.music_renamer)
+        self.root.wait_window(dialog)
+
+        if dialog.result is None:
+            return
+
+        self.music_status_var.set("Rebuilding album...")
+        self.root.update_idletasks()
+
+        threading.Thread(
+            target=self._music_rebuild_album_worker,
+            args=(album_idx, dialog.result),
+            daemon=True,
+        ).start()
+
+    def _music_rebuild_album_worker(self, album_idx: int, release_id: str):
+        try:
+            ap = self.album_proposals[album_idx]
+            release = self.music_renamer.get_release(release_id)
+            new_ap = self.music_renamer.build_album_proposal(
+                ap.group, release,
+                rename_folder=self.music_folder_rename_var.get(),
+            )
+            self.root.after(0, self._music_replace_album, album_idx, new_ap)
+        except Exception as e:
+            self.root.after(
+                0, lambda: self.music_status_var.set(f"Error: {e}"),
+            )
+
+    def _music_replace_album(self, album_idx: int, new_ap: AlbumProposal):
+        self.album_proposals[album_idx] = new_ap
+        # Simplest path: repopulate entire tree so counts stay coherent.
+        self._music_populate_tree(self.album_proposals)
+
+    def _music_apply_all(self):
+        total_ready = sum(
+            1 for ap in self.album_proposals
+            for t in ap.tracks if t.status == "ready"
+        )
+        folder_ready = sum(
+            1 for ap in self.album_proposals if ap.folder_status == "ready"
+        )
+        if total_ready == 0 and folder_ready == 0:
+            return
+        if not messagebox.askyesno(
+            "Confirm",
+            f"Apply tags and rename {total_ready} track(s) and "
+            f"{folder_ready} folder(s)?",
+        ):
+            return
+
+        self.music_apply_btn.state(["disabled"])
+        self.music_status_var.set("Applying...")
+        self.root.update_idletasks()
+
+        threading.Thread(target=self._music_apply_worker, daemon=True).start()
+
+    def _music_apply_worker(self):
+        try:
+            total_processed = 0
+            all_errors: list[str] = []
+            apply_tags = self.music_write_tags_var.get()
+            rename_folder = self.music_folder_rename_var.get()
+            for ap in self.album_proposals:
+                processed, errors = self.music_renamer.execute(
+                    ap,
+                    apply_tags=apply_tags,
+                    rename_files=True,
+                    rename_folder=rename_folder,
+                )
+                total_processed += processed
+                all_errors.extend(errors)
+
+            def done():
+                msg = f"Processed {total_processed} track(s)."
+                self.music_status_var.set(msg)
+                if all_errors:
+                    messagebox.showwarning("Some errors", "\n".join(all_errors))
+                self._music_refresh_after_apply()
+            self.root.after(0, done)
+        except Exception as e:
+            self.root.after(
+                0, lambda: self.music_status_var.set(f"Error: {e}"),
+            )
+
+    def _music_refresh_after_apply(self):
+        path_str = self.music_path_var.get().strip()
+        if not path_str:
+            return
+        target = Path(path_str)
+        # If the selected folder itself got renamed, adjust the path.
+        if not target.exists() and len(self.album_proposals) == 1:
+            ap = self.album_proposals[0]
+            if ap.new_folder_path and ap.new_folder_path.exists():
+                target = ap.new_folder_path
+                self.music_path_var.set(str(target))
+        if not target.exists():
+            return
+        self.music_scan_after_rename = True
+        self._music_scan()
+
+
+class MusicMatchDialog(tk.Toplevel):
+    """Dialog for manually searching MusicBrainz for an album."""
+
+    def __init__(self, parent, group: AlbumGroup, renamer: MusicRenamer):
+        super().__init__(parent)
+        self.group = group
+        self.renamer = renamer
+        self.result: str | None = None  # selected release_id
+        self.results: list[ReleaseSearchResult] = []
+
+        self.title(f"Match Album — {group.folder.name}")
+        self.geometry("720x480")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+
+        # --- Search fields ---
+        form = ttk.LabelFrame(self, text="Search MusicBrainz", padding=8)
+        form.pack(fill=tk.X, padx=10, pady=(10, 5))
+
+        r1 = ttk.Frame(form)
+        r1.pack(fill=tk.X, pady=2)
+        ttk.Label(r1, text="Album:", width=8).pack(side=tk.LEFT)
+        self.dlg_album_var = tk.StringVar(value=group.album_hint or "")
+        ttk.Entry(r1, textvariable=self.dlg_album_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0),
+        )
+
+        r2 = ttk.Frame(form)
+        r2.pack(fill=tk.X, pady=2)
+        ttk.Label(r2, text="Artist:", width=8).pack(side=tk.LEFT)
+        self.dlg_artist_var = tk.StringVar(value=group.artist_hint or "")
+        ttk.Entry(r2, textvariable=self.dlg_artist_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8),
+        )
+        ttk.Button(r2, text="Search", command=self._search).pack(side=tk.RIGHT)
+
+        # --- Results ---
+        res_frame = ttk.LabelFrame(self, text="Results", padding=8)
+        res_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        cols = ("artist", "title", "year", "tracks", "country", "score")
+        self.results_tree = ttk.Treeview(
+            res_frame, columns=cols, show="headings", selectmode="browse",
+        )
+        for c, w in [
+            ("artist", 180), ("title", 220), ("year", 60),
+            ("tracks", 60), ("country", 70), ("score", 60),
+        ]:
+            self.results_tree.heading(c, text=c.capitalize())
+            self.results_tree.column(c, width=w, minwidth=40)
+
+        vsb = ttk.Scrollbar(
+            res_frame, orient=tk.VERTICAL, command=self.results_tree.yview,
+        )
+        self.results_tree.configure(yscrollcommand=vsb.set)
+        self.results_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.results_tree.bind("<Double-1>", lambda _e: self._select())
+
+        self.dlg_status_var = tk.StringVar(
+            value=f"{len(group.files)} audio file(s) in folder. Click Search.",
+        )
+        ttk.Label(
+            self, textvariable=self.dlg_status_var, foreground="#555555",
+        ).pack(padx=10, anchor=tk.W)
+
+        btns = ttk.Frame(self, padding=10)
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(
+            side=tk.RIGHT, padx=(8, 0),
+        )
+        self.select_btn = ttk.Button(
+            btns, text="Use Selected", command=self._select,
+        )
+        self.select_btn.pack(side=tk.RIGHT)
+        self.select_btn.state(["disabled"])
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        # Auto-search on open if we have hints.
+        if group.album_hint:
+            self.after(100, self._search)
+
+    def _search(self):
+        album = self.dlg_album_var.get().strip()
+        if not album:
+            self.dlg_status_var.set("Enter an album name to search.")
+            return
+        artist = self.dlg_artist_var.get().strip() or None
+        self.results_tree.delete(*self.results_tree.get_children())
+        self.results.clear()
+        self.select_btn.state(["disabled"])
+        self.dlg_status_var.set("Searching...")
+        threading.Thread(
+            target=self._search_worker, args=(album, artist), daemon=True,
+        ).start()
+
+    def _search_worker(self, album, artist):
+        try:
+            results = self.renamer.search_releases(album, artist)
+            try:
+                self.after(0, self._populate, results)
+            except tk.TclError:
+                pass
+        except Exception as e:
+            try:
+                self.after(0, lambda: self.dlg_status_var.set(f"Error: {e}"))
+            except tk.TclError:
+                pass
+
+    def _populate(self, results: list[ReleaseSearchResult]):
+        self.results = list(results)
+        self.results_tree.delete(*self.results_tree.get_children())
+        for i, r in enumerate(results):
+            self.results_tree.insert(
+                "", tk.END, iid=str(i),
+                values=(
+                    r.artist,
+                    r.title,
+                    r.year if r.year else "",
+                    r.track_count if r.track_count else "",
+                    r.country or "",
+                    r.score,
+                ),
+            )
+        if results:
+            self.results_tree.selection_set("0")
+            self.select_btn.state(["!disabled"])
+            self.dlg_status_var.set(
+                f"{len(results)} release(s). Prefer a match where "
+                f"tracks = {len(self.group.files)}.",
+            )
+        else:
+            self.dlg_status_var.set("No results found.")
+
+    def _select(self):
+        selected = self.results_tree.selection()
+        if not selected:
+            return
+        idx = int(selected[0])
+        self.result = self.results[idx].release_id
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
 
 
 def main():

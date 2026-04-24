@@ -2,9 +2,11 @@ from pathlib import Path
 
 import click
 
+from retitle.api.musicbrainz import MusicBrainzClient
 from retitle.api.opensubtitles import OpenSubtitlesClient
 from retitle.api.tmdb import TMDBClient
 from retitle.api.tvmaze import TVMazeClient
+from retitle.music import AUDIO_EXTENSIONS, AlbumProposal, MusicRenamer
 from retitle.renamer import MEDIA_EXTENSIONS, RenameProposal, Renamer
 from retitle.subtitles import SubtitleDownloader, SubtitleProposal
 
@@ -207,6 +209,134 @@ def _display_subtitle_proposals(proposals: list[SubtitleProposal]):
         elif p.status == "error":
             click.echo(f"\n{prefix} {p.media_path.name}")
             click.secho(f"   Sub: Error — {p.error_message}", fg="red")
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--dry-run", "-n", is_flag=True, help="Preview without renaming or tagging")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+@click.option("--recursive", "-r", is_flag=True, help="Process subdirectories")
+@click.option(
+    "--no-folder-rename",
+    is_flag=True,
+    help="Don't rename the album folder, only track files",
+)
+@click.option(
+    "--no-tag-write",
+    is_flag=True,
+    help="Don't write ID3/metadata tags, only rename files",
+)
+def music(
+    path: str,
+    dry_run: bool,
+    yes: bool,
+    recursive: bool,
+    no_folder_rename: bool,
+    no_tag_write: bool,
+):
+    """Rename music files + apply tags using MusicBrainz metadata.
+
+    PATH can be a single audio file or a directory containing album folder(s).
+    Each folder is treated as one album. MusicBrainz is used to look up the
+    album and its track list, then files are tagged and renamed as
+    'NN Track Title.ext' and the parent folder as '[Year] Album Name'.
+    """
+    target = Path(path).resolve()
+    mb = MusicBrainzClient()
+    renamer = MusicRenamer(mb)
+
+    click.echo(f"Scanning {'recursively ' if recursive else ''}{target} ...")
+    groups = renamer.scan(target, recursive=recursive)
+    if not groups:
+        click.echo("No audio files found.")
+        return
+
+    album_proposals: list[AlbumProposal] = []
+    for group in groups:
+        click.echo(f"\n[{group.folder.name}] matching album ...")
+        release = renamer.auto_match(group)
+        proposal = renamer.build_album_proposal(
+            group,
+            release,
+            rename_folder=not no_folder_rename,
+        )
+        album_proposals.append(proposal)
+        _display_album_proposal(proposal)
+
+    total_ready = sum(
+        1 for ap in album_proposals for t in ap.tracks if t.status == "ready"
+    )
+    folder_ready = sum(1 for ap in album_proposals if ap.folder_status == "ready")
+
+    if total_ready == 0 and folder_ready == 0:
+        click.echo("\nNothing to change.")
+        return
+
+    if dry_run:
+        click.echo(
+            f"\nDry run: would process {total_ready} track(s) "
+            f"across {folder_ready} folder rename(s).",
+        )
+        return
+
+    if not yes:
+        click.echo()
+        if not click.confirm(
+            f"Apply changes to {total_ready} track(s) and rename "
+            f"{folder_ready} folder(s)?",
+            default=False,
+        ):
+            click.echo("Cancelled.")
+            return
+
+    total_processed = 0
+    for ap in album_proposals:
+        processed, errors = renamer.execute(
+            ap,
+            apply_tags=not no_tag_write,
+            rename_files=True,
+            rename_folder=not no_folder_rename,
+        )
+        total_processed += processed
+        for err in errors:
+            click.secho(f"  !! {err}", fg="red")
+
+    click.echo(f"\nProcessed {total_processed}/{total_ready} track(s).")
+
+
+def _display_album_proposal(proposal: AlbumProposal):
+    group = proposal.group
+    if proposal.release is None:
+        click.secho(
+            f"  !! No MusicBrainz match (hint: album='{group.album_hint}' "
+            f"artist='{group.artist_hint}')",
+            fg="yellow",
+        )
+        return
+
+    r = proposal.release
+    year = f" [{r.year}]" if r.year else ""
+    click.secho(f"  Matched: {r.artist} - {r.title}{year}", fg="green")
+
+    if proposal.folder_status == "ready":
+        click.echo(f"   Folder -> {proposal.new_folder_name}")
+    elif proposal.folder_status == "conflict":
+        click.secho(f"   Folder !! {proposal.folder_error}", fg="yellow")
+
+    for t in proposal.tracks:
+        if t.status == "ready":
+            click.echo(f"    {t.original_path.name}")
+            click.echo(f"      -> {t.new_filename}")
+        elif t.status == "conflict":
+            click.secho(
+                f"    !! {t.original_path.name}: {t.error_message}", fg="yellow",
+            )
+        elif t.status == "no_match":
+            click.secho(
+                f"    !! {t.original_path.name}: {t.error_message}", fg="yellow",
+            )
+        elif t.status == "skipped":
+            click.secho(f"    -- {t.original_path.name}: already correct", fg="cyan")
 
 
 @cli.command()

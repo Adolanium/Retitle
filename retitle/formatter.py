@@ -36,6 +36,32 @@ def format_movie_filename(title: str, year: int, ext: str) -> str:
     return sanitize_filename(name)
 
 
+def format_track_filename(
+    track_number: int,
+    title: str,
+    ext: str,
+    total_tracks: int | None = None,
+) -> str:
+    """Format an audio track filename.
+
+    Returns: '01 Song Title.ext' (or '001 Song Title.ext' if >99 tracks).
+    """
+    width = 3 if (total_tracks is not None and total_tracks >= 100) else 2
+    name = f"{track_number:0{width}d} {title}.{ext}"
+    return sanitize_filename(name)
+
+
+def format_album_folder(album: str, year: int | None) -> str:
+    """Format an album folder name.
+
+    With year: '[2010] Album Name'
+    No year:   'Album Name'
+    """
+    year_part = f"[{year}] " if year else ""
+    name = f"{year_part}{album}"
+    return sanitize_filename(name)
+
+
 def sanitize_filename(name: str) -> str:
     """Remove/replace characters that are invalid on Windows.
 
